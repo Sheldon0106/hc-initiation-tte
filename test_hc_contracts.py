@@ -123,4 +123,61 @@ class ClinicalExtension(unittest.TestCase):
         self.assertEqual(checks['random_bruteforce_groups'],200)
 
 
+class PrecisionExtension(unittest.TestCase):
+    def test_additive_ATT_bias_scenario(self):
+        # Synthetic population: Y0=.2+.2*U; treatment effect=-.03;
+        # U prevalence .5 in cases and .3 in weighted controls.
+        point=dict(risk_treated=.27,risk_control=.26,risk_difference=.01)
+        table=bridge.additive_bias_scenarios(point,{'lower':-.05,'upper':.07},[.2],[-.2,0.,.2])
+        np.testing.assert_allclose(table.RD,[.05,.01,-.03])
+        np.testing.assert_allclose(table.upper-table.lower,.12)
+        self.assertTrue(table.aggregate_risk_feasible.all())
+        self.assertTrue(table.assumptions_not_estimated.all())
+
+    def test_quantile_rank_band_coverage(self):
+        bands=bridge.mc_endpoint_bands(np.linspace(-.1,.1,500))
+        self.assertEqual(len(bands),2)
+        for band in bands:
+            self.assertGreaterEqual(band['binomial_coverage'],.95)
+            self.assertLess(band['lower'],band['upper'])
+        self.assertFalse(np.isfinite(bridge.mc_endpoint_bands([0.,1.])[0]['lower']))
+
+    def test_spawned_resume_preserves_both_random_streams_and_estimates(self):
+        import concurrent.futures as cf
+        import multiprocessing as mp
+        import queue
+        rows=[]
+        for case in range(4):
+            for person in range(12):
+                rows.append(dict(case_id=case,subject_id=person,hadm_id=person,treated=int(person==case),
+                    x=float(person%5),z=np.nan if person%4==0 else float(person)))
+        f=pd.DataFrame(rows);p=seq.make_plan(f,['x','z']);y=(f.subject_id%3==0).to_numpy(float)
+        whole=seq.bootstrap_att(p,y,repetitions=8,seed=87,analysis_signature='synthetic')
+        first=seq.bootstrap_att(p,y,repetitions=4,seed=87,analysis_signature='synthetic')
+        mimic=dict(key='synthetic-mimic',kind='mimic',plan=p,outcome=y,state=first.attrs['checkpoint_state'],
+            seed=87,population=p['patient_ids'],analysis_signature='synthetic',target=8)
+        rng=np.random.RandomState(93)
+        eicu=dict(key='synthetic-eicu',kind='eicu',plan=p,outcome=y,target=4,
+            state=dict(results=[],next_replicate=0,rng_state=rng.get_state(),specification=dict(plan_sha256=p['plan_sha256'],seed=93)))
+        bridge._precision_init(queue.Queue())
+        e_first=bridge._precision_worker(eicu)
+        e_all=bridge._precision_worker(dict(eicu,target=8))
+        eicu=dict(eicu,state=e_first['state'],target=8)
+        ctx=mp.get_context('spawn')
+        with ctx.Manager() as manager:
+            with cf.ProcessPoolExecutor(max_workers=2,mp_context=ctx,initializer=bridge._precision_init,
+                                        initargs=(manager.Queue(),)) as pool:
+                a=pool.submit(bridge._precision_worker,mimic);b=pool.submit(bridge._precision_worker,eicu)
+                a=a.result();b=b.result()
+        for expected,got in [(whole.to_dict('records'),a['state']['results']),
+                             (e_all['state']['results'],b['state']['results'])]:
+            for r,s in zip(expected,got):
+                self.assertEqual(r['replicate'],s['replicate']);self.assertEqual(r['success'],s['success'])
+                for k in ['risk_difference','risk_ratio']:
+                    self.assertTrue(np.isclose(r.get(k,np.nan),s.get(k,np.nan),atol=1e-12,equal_nan=True))
+                self.assertEqual(r.get('warnings',[]),s.get('warnings',[]))
+        self.assertTrue(bridge.rng_equal(a['state']['rng_state'],whole.attrs['checkpoint_state']['rng_state']))
+        self.assertTrue(bridge.rng_equal(b['state']['rng_state'],e_all['state']['rng_state']))
+
+
 if __name__=='__main__':unittest.main()

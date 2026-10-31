@@ -907,6 +907,325 @@ def order_validate():
         name:round(ap['estimates'][name]['summary']['RD_halves_endpoint_max_difference_pp'],2) for name in spec['scenarios']}))
 
 
+PRECISION_CONFIG=dict(
+    version='HC_order_precision_1',initial_target=500,maximum_target=1000,
+    scenarios=['mimic:primary_new','mimic:strict_new','mimic:primary_all_native',
+               'eicu:primary','eicu:strict','eicu:known_NE'],
+    fixed='same populations, plan hashes, preprocessing, L2, outcomes, seeds and estimands; resume original100 draws',
+    mimic_inference='ordinary source-patient bootstrap; all admissions and riskset roles together',
+    eicu_inference='normalized Exp(1) patient weights, conditional on observed patients/sites; not an ordinary bootstrap CI or new-hospital inference',
+    MC_rule='RD percentile endpoint binomial-order-statistic95% Monte Carlo bands; extend500 to1000 if either band width exceeds2 percentage points; retain unresolved numerical imprecision at1000',
+    MC_max_band_width_pp=2.,workers=2,checkpoint_every=25,
+    failures='retain every attempt and warning, no replacement or seed search; any failure requires interpretation before interval use',
+    bias='ATT additive scenario: bias=gamma0*(p_U_treated-p_U_weighted_control); constant untreated outcome contrast gamma0 and prevalence difference across measured covariate strata',
+    bias_gamma=[.10,.20,.30],bias_delta=[-.30,-.20,-.10,0.,.10,.20,.30],
+    bias_interpretation='researcher-selected scenarios, not estimated or clinically validated; shift RD and conditional sampling interval by the same fixed bias, not a new identified effect',
+    prior_results_seen=True,raw_scans=0)
+
+
+def mc_endpoint_bands(values,alpha=.05):
+    """Order-statistic bands for finite simulation error, not clinical uncertainty."""
+    from scipy.stats import binom
+    values=np.sort(np.asarray(values,float));values=values[np.isfinite(values)];n=len(values)
+    out=[]
+    for p in [.025,.975]:
+        # With K~Binomial(n,p), X_(lo) <= q_p <= X_(hi) iff lo<=K<hi.
+        lo=int(binom.ppf(alpha/2,n,p));hi=int(binom.ppf(1-alpha/2,n,p))+1
+        lower=float(values[lo-1]) if lo>=1 else -np.inf
+        upper=float(values[hi-1]) if hi<=n else np.inf
+        coverage=float(binom.cdf(hi-1,n,p)-binom.cdf(lo-1,n,p))
+        out.append(dict(probability=p,lower=lower,upper=upper,width_pp=100*(upper-lower),
+            lower_rank=lo,upper_rank=hi,binomial_coverage=coverage))
+    return out
+
+
+def standardized_bootstrap(table,kind):
+    t=pd.DataFrame(table).copy()
+    if kind=='eicu':t=t.rename(columns={'initiated_risk':'risk_treated','not_yet_risk':'risk_control'})
+    return t
+
+
+def precision_summary(records,kind):
+    t=standardized_bootstrap(records,kind);s=bootstrap_summary(t)
+    s['preliminary_100']=len(t)<500
+    v=t.loc[t.success,'risk_difference'].to_numpy(float)
+    s['MC_bands']=mc_endpoint_bands(v)
+    s['MC_numerical_target_met']=all(z['width_pp']<=PRECISION_CONFIG['MC_max_band_width_pp'] for z in s['MC_bands'])
+    s['cumulative_RD_intervals']={}
+    for n in [100,250,500,1000]:
+        if len(t)>=n:
+            z=t.iloc[:n];v=z.loc[z.success,'risk_difference'].to_numpy(float)
+            s['cumulative_RD_intervals'][n]=np.quantile(v,[.025,.975]).tolist()
+    return s
+
+
+def precision_plan():
+    import copy
+    import steroid_eicu as eicu
+    b,e,d=load();ap=d['analysis_phase'];assert 'validation' in ap
+    if 'precision_phase' in d:
+        assert d['precision_phase']['config']==PRECISION_CONFIG
+        say(dict(stage='precision_plan',reuse=True));return
+    eb=eicu.load();ed=eb['clinical_extension']['order_estimation']
+    assert ed['config']==eicu.ORDER_ESTIMATION_CONFIG and 'validation' in ed
+    signature=(eicu.STATE.stat().st_size,eicu.STATE.stat().st_mtime_ns)
+    px=dict(config=PRECISION_CONFIG,utc=seq.base().utc(),jobs={},
+        original_mimic_analysis_signature=ap['signature'],eicu_source_signature=signature,
+        eicu_source_sha256=seq.sha(eicu.STATE),source_at_freeze=Path(__file__).read_bytes(),
+        existing_eicu_site_sensitivity=copy.deepcopy(ed['largest_site_exclusion']))
+    for key in PRECISION_CONFIG['scenarios']:
+        kind,name=key.split(':')
+        if kind=='mimic':
+            old=ap['estimates'][name];state=copy.deepcopy(old['bootstrap_state']);point=old['point']
+        else:
+            old=ed['results'][name];p=eicu.order_plan(ed['scenarios'][name]['frame'],seq)
+            assert p['plan_sha256']==ed['scenarios'][name]['plan_sha256']
+            # Confirm the saved random stream really follows the original100 draws.
+            rng=np.random.RandomState(ed['config']['bootstrap_seed'])
+            for _ in range(100):rng.exponential(1.,len(p['patient_ids']))
+            assert rng_equal(rng.get_state(),old['rng_state'])
+            state=dict(results=copy.deepcopy(old['bootstrap']),next_replicate=100,rng_state=old['rng_state'],
+                specification=dict(plan_sha256=p['plan_sha256'],seed=ed['config']['bootstrap_seed'],
+                    config_sha256=hashlib.sha256(json.dumps(ed['config'],sort_keys=True).encode()).hexdigest()))
+            point=dict(old['point'],risk_treated=old['point']['initiated_risk'],risk_control=old['point']['not_yet_risk'])
+        assert state['next_replicate']==100
+        px['jobs'][key]=dict(kind=kind,scenario=name,state=state,original100=copy.deepcopy(state['results']),
+            point=copy.deepcopy(point),target=500,complete=False,prior_intervals=copy.deepcopy(old.get('summary',old.get('uncertainty'))))
+    d['precision_phase']=px;save(d)
+    say(dict(stage='precision_plan',scenarios=6,initial_repetitions=500,maximum_repetitions=1000,
+        workers=2,raw_scans=0,expected_peak_total_GiB='6-9',expected_minutes='60-90',prior100_preserved=True))
+
+
+def rng_equal(a,b):
+    return a[0]==b[0] and np.array_equal(a[1],b[1]) and a[2:]==b[2:]
+
+
+def _precision_init(channel):
+    global _PRECISION_CHANNEL
+    _PRECISION_CHANNEL=channel
+
+
+def _precision_worker(job):
+    """Pure worker: private arrays in memory; one parent owns all checkpoint I/O."""
+    key=job['key'];kind=job['kind'];p=job['plan'];y=job['outcome'];start=time.perf_counter()
+    def checkpoint(payload):_PRECISION_CHANNEL.put((key,'checkpoint',payload))
+    if kind=='mimic':
+        table=seq.bootstrap_att(p,y,repetitions=job['target'],seed=job['seed'],source_patient_ids=job['population'],
+            l2=1.,checkpoint_callback=checkpoint,checkpoint_every=PRECISION_CONFIG['checkpoint_every'],
+            resume_state=job['state'],analysis_signature=job['analysis_signature'])
+        state=table.attrs['checkpoint_state']
+    else:
+        import steroid_eicu as eicu
+        state=job['state'];assert state['specification']['plan_sha256']==p['plan_sha256']
+        rng=np.random.RandomState(state['specification']['seed']);rng.set_state(state['rng_state'])
+        records=[dict(z) for z in state['results']]
+        for rep in range(len(records),job['target']):
+            row=dict(replicate=rep,success=False)
+            try:
+                v=rng.exponential(1.,len(p['patient_ids']));v=v*len(v)/v.sum()
+                fit=eicu.order_fit_positive(seq,p,v);w=seq.att_weights(p,fit['linear_predictor'],fit['mult'])
+                row.update(eicu.order_endpoint_summary(p,w,y));row.update(success=True,warnings=fit['fit']['warnings'],
+                    iterations=fit['fit']['iterations'],fit_seconds=fit['fit']['seconds'])
+            except (seq.EstimatorFailure,FloatingPointError,RuntimeError,ValueError) as exc:
+                row.update(error_type=type(exc).__name__,error=str(exc))
+            records.append(row)
+            if len(records)%PRECISION_CONFIG['checkpoint_every']==0:
+                checkpoint(dict(state,results=records,next_replicate=len(records),rng_state=rng.get_state()))
+        state=dict(state,results=records,next_replicate=len(records),rng_state=rng.get_state())
+        checkpoint(state)
+    return dict(state=state,summary=precision_summary(state['results'],kind),seconds=time.perf_counter()-start,
+        peak_worker_MB=seq.base().peak_mb())
+
+
+def precision_run():
+    import concurrent.futures as cf
+    import multiprocessing as mp
+    import queue
+    import gc
+    import steroid_eicu as eicu
+    b,e,d=load();px=d['precision_phase'];assert px['config']==PRECISION_CONFIG
+    assert px['original_mimic_analysis_signature']==d['analysis_phase']['signature']
+    assert tuple(px['eicu_source_signature'])==(eicu.STATE.stat().st_size,eicu.STATE.stat().st_mtime_ns)
+    eb=eicu.load();ed=eb['clinical_extension']['order_estimation'];plans={}
+    for key in PRECISION_CONFIG['scenarios']:
+        state=px['jobs'][key]
+        if state['complete']:continue
+        kind,name=key.split(':')
+        if kind=='mimic':
+            f=analysis_frame(d,name);s=d['analysis_phase']['config']
+            p=seq.make_plan(f,s['numerical'],s['categorical'],diagnostic_numeric=['NE_dose'])
+            y=f.hadm_id.map(b['source'].set_index('hadm_id').hospital_expire_flag).to_numpy(float)
+            extra=dict(population=b['source'].subject_id.unique(),seed=s['bootstrap_seed'],analysis_signature=d['analysis_phase']['signature'])
+        else:
+            f=ed['scenarios'][name]['frame'];p=eicu.order_plan(f,seq)
+            y=f.hospital.map(eb['hospital_summary'].set_index('hospital_stay').outcome).map({'alive':0.,'expired':1.}).to_numpy(float)
+            extra={}
+        assert p['plan_sha256']==state['state']['specification']['plan_sha256']
+        plans[key]=dict(key=key,kind=kind,plan=p,outcome=y,**extra)
+    del b,e,eb,ed;gc.collect()
+    if not plans:say(dict(stage='precision_run',reuse=True));return
+    ctx=mp.get_context('spawn')
+    with ctx.Manager() as manager:
+        channel=manager.Queue()
+        with cf.ProcessPoolExecutor(max_workers=PRECISION_CONFIG['workers'],mp_context=ctx,
+                                    initializer=_precision_init,initargs=(channel,)) as pool:
+            pending={};waiting=list(plans)
+            while waiting or pending:
+                while waiting and len(pending)<PRECISION_CONFIG['workers']:
+                    key=waiting.pop(0);state=px['jobs'][key]
+                    payload=dict(plans[key],state=state['state'],target=state['target'])
+                    pending[pool.submit(_precision_worker,payload)]=key
+                    say(dict(stage='precision_start',scenario=key,from_replicate=state['state']['next_replicate'],target=state['target'],raw_scans=0))
+                try:
+                    key,kind,payload=channel.get(timeout=.5)
+                    if payload['next_replicate']>px['jobs'][key]['state']['next_replicate']:
+                        px['jobs'][key]['state']=payload;save(d)
+                        say(dict(stage='precision_checkpoint',scenario=key,attempts=payload['next_replicate'],
+                            failures=sum(not z['success'] for z in payload['results'])))
+                except queue.Empty:pass
+                for future in list(pending):
+                    if not future.done():continue
+                    key=pending.pop(future);result=future.result();state=px['jobs'][key]
+                    state.update(result);summary=result['summary'];state.setdefault('round_summaries',{})[state['target']]=summary
+                    # Numerical criterion only. No effect, sign, P value or desired interval enters.
+                    extend=state['target']==500 and not summary['MC_numerical_target_met'] and summary['failures']==0
+                    if extend:state['target']=1000;waiting.append(key)
+                    else:state['complete']=True
+                    save(d)
+                    say(dict(stage='precision_round_done',scenario=key,attempts=summary['attempts'],failures=summary['failures'],
+                        warnings=summary['warning_replicates'],MC_max_band_width_pp=round(max(z['width_pp'] for z in summary['MC_bands']),2),extend_to1000=extend))
+    px['complete']=all(z['complete'] for z in px['jobs'].values());px['source_current']=Path(__file__).read_bytes();save(d)
+    say(dict(stage='precision_run_complete',complete=px['complete'],raw_scans=0))
+
+
+def additive_bias_scenarios(point,interval,gammas,deltas):
+    """ATT scenario under a constant untreated-risk contrast and imbalance."""
+    rows=[]
+    for gamma in gammas:
+        for delta in deltas:
+            bias=gamma*delta
+            control_cf=point['risk_control']+bias
+            rows.append(dict(gamma0=gamma,prevalence_difference=delta,bias=bias,
+                RD=point['risk_difference']-bias,lower=interval['lower']-bias,upper=interval['upper']-bias,
+                counterfactual_control_risk=control_cf,aggregate_risk_feasible=0<=control_cf<=1,
+                assumptions_not_estimated=True))
+    return pd.DataFrame(rows)
+
+
+def precision_validate():
+    import steroid_eicu as eicu
+    b,e,d=load();px=d['precision_phase'];assert px['complete'] and px['config']==PRECISION_CONFIG
+    eb=eicu.load();ed=eb['clinical_extension']['order_estimation'];checks={}
+    assert seq.sha(eicu.STATE)==px['eicu_source_sha256']
+    assert d['analysis_phase']['signature']==px['original_mimic_analysis_signature']
+    for key,j in px['jobs'].items():
+        kind,name=key.split(':');state=j['state'];rows=state['results'];n=len(rows)
+        assert n in [500,1000] and state['next_replicate']==n and [r['replicate'] for r in rows]==list(range(n))
+        saved=pd.DataFrame(j['original100']);first=pd.DataFrame(rows[:100])
+        pd.testing.assert_frame_equal(first[saved.columns],saved,check_dtype=False,check_exact=True)
+        if kind=='mimic':
+            cfg=d['analysis_phase']['config'];f=analysis_frame(d,name)
+            p=seq.make_plan(f,cfg['numerical'],cfg['categorical'],diagnostic_numeric=['NE_dose'])
+            y=f.hadm_id.map(b['source'].set_index('hadm_id').hospital_expire_flag).to_numpy(float)
+            lp=d['clinical_phase']['assignment'][name]['linear_predictor'];w=seq.att_weights(p,lp)
+            original=d['analysis_phase']['estimates'][name]
+            assert original['point']==j['point']
+            direct=seq.binary_risks(p,w,y)
+            pd.testing.assert_frame_equal(saved[original['bootstrap'].columns],original['bootstrap'],check_dtype=False,check_exact=True)
+            rng=np.random.RandomState(cfg['bootstrap_seed'])
+            for _ in range(n):seq.draw_patient_counts(p,rng,b['source'].subject_id.unique())
+        else:
+            f=ed['scenarios'][name]['frame'];p=eicu.order_plan(f,seq)
+            y=f.hospital.map(eb['hospital_summary'].set_index('hospital_stay').outcome).map({'alive':0.,'expired':1.}).to_numpy(float)
+            original=ed['results'][name];w=seq.att_weights(p,original['point_model']['linear_predictor'])
+            direct=eicu.order_endpoint_summary(p,w,y)
+            pd.testing.assert_frame_equal(saved,pd.DataFrame(original['bootstrap']),check_dtype=False,check_exact=True)
+            rng=np.random.RandomState(ed['config']['bootstrap_seed'])
+            for _ in range(n):rng.exponential(1.,len(p['patient_ids']))
+        assert p['plan_sha256']==state['specification']['plan_sha256']
+        assert rng_equal(rng.get_state(),state['rng_state'])
+        assert all(np.isclose(direct[k],j['point'][k],atol=1e-12,equal_nan=True) for k in direct)
+        assert np.allclose(np.add.reduceat(w['control'],p['starts']),1.)
+        fresh=precision_summary(rows,kind);assert fresh==j['summary']
+        assert not fresh['failures'],'Failed draws require interpretation before interval publication'
+        j['bias_scenarios']=additive_bias_scenarios(j['point'],fresh['intervals']['risk_difference'],
+            px['config']['bias_gamma'],px['config']['bias_delta'])
+        checks[key]=dict(first100_exact=True,all_draw_indices_present=True,random_stream_continuous=True,
+            point_unchanged=True,original_data_signature=True,plan_unchanged=True,all_riskset_mass=True,
+            no_new_model_selection=True,MC_target_met=fresh['MC_numerical_target_met'])
+    ref=b['precision_extension']['summary']
+    r=ref[ref.clock.eq('primary')&ref.attempts.eq(500)].set_index('metric')
+    pt={k:float(r.loc[k,'point']) for k in ['risk_treated','risk_control','risk_difference','risk_ratio']}
+    bounds={k:float(r.loc['risk_difference',k]) for k in ['lower','upper']}
+    px['actual_dose_bias_scenarios']=additive_bias_scenarios(pt,bounds,px['config']['bias_gamma'],px['config']['bias_delta'])
+    px['validation']=dict(checks=checks,original_actual_dose_unchanged=True,eicu_original100_unchanged=True,
+        uncertainty_scopes='MIMIC source-patient bootstrap; eICU patient positive-weight bootstrap conditional on observed sites; no new-hospital uncertainty estimated',
+        bias_formula='ATT_obs - ATT_true = E_X|A=1[gamma0(X)*(p1(X)-p0(X))]; constant gamma0 and delta assumed for scenario grid',
+        bias_source='https://doi.org/10.1097/EDE.0b013e3181f74493',
+        MC_source='https://www-users.york.ac.uk/~mb55/intro/cicent4.htm',
+        bootstrap_MC_source='https://doi.org/10.1080/00031305.2015.1089789',
+        utc=seq.base().utc(),new_fits=0,source=Path(__file__).read_bytes())
+    save(d);say(dict(stage='precision_validate',passed=True,scenarios=len(checks),new_fits=0,
+        unresolved_MC=[k for k,v in checks.items() if not v['MC_target_met']]))
+
+
+def precision_progress(d,m):
+    px=d.get('precision_phase',{})
+    if 'validation' not in px:return []
+    labels={'mimic:primary_new':'MIMIC新医嘱','mimic:strict_new':'MIMIC严格时钟',
+            'mimic:primary_all_native':'MIMIC包含Change','eicu:primary':'eICU医嘱',
+            'eicu:strict':'eICU严格时钟','eicu:known_NE':'eICU可解释NE剂量子集'}
+    def cell(j,key,scale):
+        z=j['summary']['intervals'][key];digits=3 if scale==1 else 2
+        return f'{scale*j["point"][key]:.{digits}f}〔{scale*z["lower"]:.{digits}f}, {scale*z["upper"]:.{digits}f}〕'
+    lines=['','### M3：区间精度与固定敏感性结果','',
+        '**以下为续跑后的当前区间，前文100次结果保留为历史首版。** 六套队列、起点、协变量、评分模型和点估计均不变；从原随机状态续跑，并逐条核对前100次完全一致。原MIMIC实际首剂500次结果保留。','',
+        '|固定口径|重抽样次数|启动风险%，95%区间|对照风险%，95%区间|RD，百分点，95%区间|RR，95%区间|',
+        '|---|---:|---:|---:|---:|---:|']
+    for key in px['config']['scenarios']:
+        j=px['jobs'][key];s=j['summary']
+        lines.append('|'+labels[key]+'|'+str(s['attempts'])+'|'+'|'.join(cell(j,k,v) for k,v in
+            [('risk_treated',100),('risk_control',100),('risk_difference',100),('risk_ratio',1)])+'|')
+    lines+=['','MIMIC为普通源患者重抽样百分位区间；eICU为患者Exp(1)正权重百分位不确定性区间，条件于已观察患者与医院支持。二者不是同一种抽样推断，均未估计推广至新医院的误差。患者的所有住院和病例/对照角色共享一次权重，每次重新拟合预处理和原评分模型。','',
+        '|固定口径|失败 / 警告 / RR未定义|RD区间半宽（百分点）|100次→当前端点最大变化|MC端点带最大宽度（百分点）|数值目标|',
+        '|---|---:|---:|---:|---:|---|']
+    for key in px['config']['scenarios']:
+        j=px['jobs'][key];s=j['summary'];v=s['intervals']['risk_difference']
+        drift=100*np.max(np.abs(np.asarray(s['cumulative_RD_intervals'][100])-[v['lower'],v['upper']]))
+        width=max(q['width_pp'] for q in s['MC_bands'])
+        lines.append(f'|{labels[key]}|{s["failures"]} / {s["warning_replicates"]} / {s["intervals"]["risk_ratio"]["undefined_n"]}|{50*(v["upper"]-v["lower"]):.2f}|{drift:.2f}|{width:.2f}|'+('达到' if s['MC_numerical_target_met'] else '尚未达到')+'|')
+    lines+=['','续跑前固定数值规则：先至500次；用二项分布秩界给出每个RD区间端点的95% Monte Carlo带，任一带宽超过2个百分点则续至1000次。2个百分点是本轮计算精度标准，不是临床重要性或发表门槛，也不是治疗效果区间的宽度。到1000次仍不满足时照实报告，不按方向、显著性或预期结论继续择优。端点带为边际带，不主张两个端点同时95%覆盖。',
+        '±5和±10个百分点继续作为区间半宽的规划参照，并非临床认可标准；上表直接给出实际半宽。更多重抽样不会提高独立患者信息量，也不修复有限支持。参考：[分位数二项秩界](https://www-users.york.ac.uk/~mb55/intro/cicent4.htm)、[bootstrap计算误差](https://doi.org/10.1080/00031305.2015.1089789)。','',
+        '#### 缺失结局与预定医院影响','',
+        '|eICU固定口径|未知结局极值界限，保守向外取整（百分点）|','|---|---:|']
+    for name in ['primary','strict','known_NE']:
+        p=px['jobs']['eicu:'+name]['point']
+        lines.append(f'|{labels["eicu:"+name]}|{int(np.floor(100*p["RD_missing_lower"]))}至{int(np.ceil(100*p["RD_missing_upper"]))}|')
+    site=px['existing_eicu_site_sensitivity'];p=site['point']
+    lines+=['','这些是固定权重下未知结局的极值界限，不包含抽样误差或未测混杂；未知仍保留，未填为存活。为避免由风险与界限联立反推少数未知结局的数量，公开表向外取整至整数百分点；精确值保存在原私有缓存中。',
+        f'既定最大贡献医院排除分析沿用原结果：剩余约{m.count(site["remaining_cases"])}个启动节点，RD {100*p["risk_difference"]:+.2f}个百分点，RR {p["risk_ratio"]:.3f}；最大绝对SMD {site["balance"].smd_after.abs().max():.3f}，对照患者ESS {site["concentration"]["control_patient"]["ess"]:.1f}。仅有点估计，不添加未经计算的区间；它改变目标人群，不能代替医院整群不确定性或外部验证。','',
+        '#### 未测混杂：有限的定量情景','',
+        '令U表示索引前尚未记录的病情或HC用途；δ为启动者与已加权对照的U患病比例差，γ₀为在暂不启动HC条件下U关联的死亡风险差。在已测协变量层内γ₀与δ均恒定的简化ATT模型中，偏倚为γ₀×δ；情景RD等于观察RD减去该偏倚。[VanderWeele与Arah的偏倚公式](https://doi.org/10.1097/EDE.0b013e3181f74493)为此提供一般框架。',
+        '本轮在续跑前固定γ₀=10、20、30个百分点，δ=−30、−20、−10、0、10、20、30个百分点，全部组合保留。它们是研究者情景，不是从HC用途或限制治疗资料估计的比例；正负失衡均评估。对固定偏倚平移抽样区间，没有为这些未知参数捏造概率分布。','',
+        '|γ₀ \u00d7 δ|δ=10个百分点|δ=20个百分点|δ=30个百分点|','|---|---:|---:|---:|',
+        '|γ₀=10个百分点|1个百分点|2个百分点|3个百分点|',
+        '|γ₀=20个百分点|2个百分点|4个百分点|6个百分点|',
+        '|γ₀=30个百分点|3个百分点|6个百分点|9个百分点|','',
+        'δ为负时，上表偏倚取相反符号。下面并列同一固定示例γ₀=20个百分点、δ=±20个百分点；完整21格情景由代码保存在现有私有缓存中。','',
+        '|主视角|δ=+20个百分点：情景RD〔条件区间〕|δ=−20个百分点：情景RD〔条件区间〕|','|---|---:|---:|']
+    for label,table in [('MIMIC实际首剂',px['actual_dose_bias_scenarios']),
+                        ('MIMIC新医嘱',px['jobs']['mimic:primary_new']['bias_scenarios']),
+                        ('eICU医嘱',px['jobs']['eicu:primary']['bias_scenarios'])]:
+        cells=[]
+        for delta in [.20,-.20]:
+            r=table[np.isclose(table.gamma0,.20)&np.isclose(table.prevalence_difference,delta)].iloc[0]
+            cells.append(f'{100*r.RD:+.2f}〔{100*r.lower:+.2f}, {100*r.upper:+.2f}〕')
+        lines.append('|'+label+'|'+'|'.join(cells)+'|')
+    lines+=['','该情景计算没有证明U存在或达到某个强度，也不能修复医嘱、实际执行和临床用途的错分。其用途是说明剩余混杂在什么量级上会改变解释，不从情景中选择最有利的结果。','',
+        '**阶段决定：**保留原MIMIC实际首剂为主分析，MIMIC医嘱与eICU医嘱分别作为相关决策的补充证据。进入稿件整合，不合并为共同治疗效果，不宣称已经验证HC伤害或获益；HC用途、真实决定时间与局部支持仍决定临床解释范围。当前无需追加原始表。']
+    return lines
+
+
 def partition_percentages(counts,total):
     """Suppress rare cells plus a complement so row totals cannot reveal them."""
     counts=[int(n) for n in counts]
@@ -1122,6 +1441,7 @@ def publish():
     lines+=clinical_progress(d,m)
     lines+=estimation_progress(d)
     lines+=cross_database_progress(d,m,b)
+    lines+=precision_progress(d,m)
     lines+=['',f'本阶段累计原始读取{raw_bytes/2**30:.2f} GiB，解析{seconds/60:.1f}分钟，扫描进程峰值内存{peak:.1f} MB；风险集构建约{d["support_seconds"]:.1f}秒。处方、版本链、临床窗口与结构化限制均按所需字段/范围投影并核对EOF、输入签名和流式哈希；不是将这些大表整体载入内存，也不是新增下载体积。',
         '批量风险集版本在固定首节点与完整原规则核对一致；资格与时钟未修改。已完成投影自动复用，无需再次下载或重扫。',
         '与原实际首剂研究相比，本医嘱分析同时重建了起点、既往医嘱资格和治疗限制资料，目标人群也有变化。因此两版估计的差异不能全部归因于医嘱与给药的时间差；它们是同一临床主题下不同记录决策的比较。','',
@@ -1169,6 +1489,36 @@ def publish():
         if 'validation' in d['analysis_phase']:
             task='复核小风险集下的不确定性方法，明确患者所有住院及多种风险集角色共享权重、每次重拟合预处理与评分。'
             new=new.replace('- [ ] '+task,'- [x] '+task)
+    if 'validation' in d.get('precision_phase',{}):
+        px=d['precision_phase']
+        new=new.replace('### 已完成的探索性医嘱关联比较','### 首版探索性医嘱关联比较（100次历史区间）')
+        new=new.replace('|三个主视角（分别估计）|','|三个主视角（首版历史区间；当前区间见M3）|')
+        new=new.replace('### M3 · 完善推断与有限敏感性（约3–5个有效工作日）',
+            '### M3 · 完善推断与有限敏感性（本轮完成；精度见实测端点带）')
+        for task in ['区分患者抽样、固定医院支持与推广至新医院三种不确定性；不以医院数多就自动声称可推广。',
+                     '方法确定后，将必要区间扩至至少500次并检查端点Monte Carlo稳定性；记录全部失败和警告。',
+                     '固定报告严格时钟、NE剂量可解释子集、未知结局界限及已指定的大医院影响，不搜索最有利版本。',
+                     '针对HC用途和未测病情制定一个可解释的定量偏倚情景；不把它当作消除混杂的证明。']:
+            new=new.replace('- [ ] '+task,'- [x] '+task)
+        new=new.replace('当前唯一下一工作包：**M3不确定性完善与已指定敏感性**。',
+            '当前唯一下一工作包：**M4整合主分析、医嘱补充及解释边界，形成稿件**。')
+        for label,key,desc in [('MIMIC独立医嘱补充','mimic:primary_new','明确New且符合记录资格的HC医嘱；约200个节点、3,900位独立对照'),
+            ('eICU-CRD2.0补充','eicu:primary','HC医嘱节点；约480次启动、3,840位独立对照、约50家贡献启动节点的医院'),
+            ('eICU严格录入时钟','eicu:strict','相同队列与行动，改变可用调整信息'),
+            ('eICU NE剂量可解释子集','eicu:known_NE','同时限制启动者及对照，目标人群改变')]:
+            j=px['jobs'][key];s=j['summary'];v=s['intervals']['risk_difference']
+            kind='普通患者bootstrap' if key.startswith('mimic') else '患者正权重区间；条件于现有支持'
+            row=f'|{label}|{desc}|{100*j["point"]["risk_difference"]:+.2f}〔{100*v["lower"]:+.2f}, {100*v["upper"]:+.2f}〕|{s["attempts"]}次{kind}|'
+            new=re.sub(r'^\|'+re.escape(label)+r'\|.*$',row,new,flags=re.M)
+        new=new.replace('三个口径各100次、无优化失败或警告。','首版三个口径各100次、无优化失败或警告；续跑精度与全部运行状态见M3结果。')
+        new=new.replace('保持分别报告，进入不确定性完善。','保持分别报告，完成本轮不确定性与敏感性分析，进入稿件整合。')
+        new=new.replace('python -X utf8 hc_order_bridge.py order_validate\npython -X utf8 hc_order_bridge.py publish',
+            'python -X utf8 hc_order_bridge.py order_validate\npython -X utf8 hc_order_bridge.py precision_plan\npython -X utf8 hc_order_bridge.py precision_run\npython -X utf8 hc_order_bridge.py precision_validate\npython -X utf8 hc_order_bridge.py publish')
+        note='精度续跑由`precision_plan/run/validate`执行，保留原100次及两库原缓存；两个独立进程计算、单个父进程保存现有检查点，避免线程共享警告或并发覆盖。数值规则见M3；合成数据已核对串行、并行和中断续跑结果相同。'
+        if note not in new:new=new.replace('**当前复现边界：**',note+'\n\n**当前复现边界：**')
+        # Keep prior-generation narratives identifiable without altering estimates.
+        body=body.replace('### 已完成的探索性医嘱关联比较','### 首版探索性医嘱关联比较（100次历史区间）')
+        body=body.replace('|三个主视角（分别估计）|','|三个主视角（首版历史区间；当前区间见M3）|')
     readme.write_bytes(new.encode('utf-8'))
     report=configured_path('canonical_source_dir','../HTE_sepsis')/'steroid_tte.md'
     before=report.read_bytes();nl='\r\n' if b'\r\n' in before else '\n';old=before.decode('utf-8').replace('\r\n','\n')
@@ -1190,7 +1540,7 @@ def publish():
 
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('stage',choices=['plan','project','evaluate','support','lineage','clinical_plan','clinical_project','clinical_features','analysis_freeze','clinical_score','estimation_review','order_estimate','order_validate','publish']);a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('stage',choices=['plan','project','evaluate','support','lineage','clinical_plan','clinical_project','clinical_features','analysis_freeze','clinical_score','estimation_review','order_estimate','order_validate','precision_plan','precision_run','precision_validate','publish']);a=p.parse_args()
     globals()[a.stage]()
 
 

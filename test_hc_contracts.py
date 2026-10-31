@@ -124,6 +124,29 @@ class ClinicalExtension(unittest.TestCase):
 
 
 class PrecisionExtension(unittest.TestCase):
+    def test_checkpoint_preserves_complete_files_during_reader_lock(self):
+        import tempfile
+        import threading
+        import time
+        # Two newly created temporary files only; no patient cache is touched.
+        a=tempfile.NamedTemporaryFile(delete=False);b=tempfile.NamedTemporaryFile(delete=False)
+        old=Path(a.name);new=Path(b.name)
+        a.write(b'old-complete-checkpoint');a.close()
+        b.write(b'new-complete-checkpoint');b.close()
+        reader=old.open('rb')
+        def release():
+            time.sleep(.2)
+            reader.close()
+        thread=threading.Thread(target=release);thread.start()
+        try:
+            bridge.replace_checkpoint(new,old,timeout=3.)
+            self.assertEqual(old.read_bytes(),b'new-complete-checkpoint')
+            self.assertFalse(new.exists())
+        finally:
+            thread.join();reader.close()
+            for path in [old,new]:
+                if path.exists():path.unlink()
+
     def test_additive_ATT_bias_scenario(self):
         # Synthetic population: Y0=.2+.2*U; treatment effect=-.03;
         # U prevalence .5 in cases and .3 in weighted controls.

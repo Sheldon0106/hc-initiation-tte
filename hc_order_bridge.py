@@ -88,12 +88,24 @@ def load():
     return b,side['event_review'],d
 
 
+def replace_checkpoint(temp,path,timeout=30.):
+    """Preserve the complete old file while a short Windows reader lock clears."""
+    deadline=time.monotonic()+timeout
+    while True:
+        try:
+            os.replace(str(temp),str(path))
+            return
+        except PermissionError:
+            if time.monotonic()>=deadline:raise
+            time.sleep(.1)
+
+
 def save(d):
     path=state_path();side=pd.read_pickle(path)
     side[BRANCH]=d
     temp=path.with_name(path.name+'.writing')
     pd.to_pickle(side,temp,compression={'method':'gzip','compresslevel':1})
-    os.replace(str(temp),str(path))
+    replace_checkpoint(temp,path)
 
 
 def plan():
@@ -1194,6 +1206,8 @@ def precision_progress(d,m):
         drift=100*np.max(np.abs(np.asarray(s['cumulative_RD_intervals'][100])-[v['lower'],v['upper']]))
         width=max(q['width_pp'] for q in s['MC_bands'])
         lines.append(f'|{labels[key]}|{s["failures"]} / {s["warning_replicates"]} / {s["intervals"]["risk_ratio"]["undefined_n"]}|{50*(v["upper"]-v["lower"]):.2f}|{drift:.2f}|{width:.2f}|'+('达到' if s['MC_numerical_target_met'] else '尚未达到')+'|')
+    if px.get('execution_events'):
+        lines+=['',f'运行中发生{len(px["execution_events"])}次检查点保存中断（Windows文件锁），已从经核对的完整检查点恢复。已保存的抽样保留，尚未保存部分从同一随机状态重算；全序列核对无遗漏或重复。这是运行层中断，不计为拟合失败，也没有替换不利的抽样。']
     lines+=['','续跑前固定数值规则：先至500次；用二项分布秩界给出每个RD区间端点的95% Monte Carlo带，任一带宽超过2个百分点则续至1000次。2个百分点是本轮计算精度标准，不是临床重要性或发表门槛，也不是治疗效果区间的宽度。到1000次仍不满足时照实报告，不按方向、显著性或预期结论继续择优。端点带为边际带，不主张两个端点同时95%覆盖。',
         '±5和±10个百分点继续作为区间半宽的规划参照，并非临床认可标准；上表直接给出实际半宽。更多重抽样不会提高独立患者信息量，也不修复有限支持。参考：[分位数二项秩界](https://www-users.york.ac.uk/~mb55/intro/cicent4.htm)、[bootstrap计算误差](https://doi.org/10.1080/00031305.2015.1089789)。','',
         '#### 缺失结局与预定医院影响','',
@@ -1428,9 +1442,11 @@ def publish():
     complete='features' in d.get('clinical_phase',{})
     effects_complete=d.get('analysis_phase',{}).get('result_status')=='THREE_FIXED_ORDER_ASSOCIATIONS_100_SOURCE_PATIENT_BOOTSTRAPS'
     precision_complete='validation' in d.get('precision_phase',{})
+    precision_repetitions=' / '.join(str(n) for n in sorted({j['summary']['attempts']
+        for j in d['precision_phase']['jobs'].values()})) if precision_complete else ''
     if effects_complete:assert 'validation' in d['analysis_phase']
     heading='**已完成独立医嘱队列、临床重建、固定支持诊断与三套探索性关联估计。**' if effects_complete else ('**已完成独立来源、新起点临床重建及固定支持诊断。**' if complete else '**已完成独立来源及技术风险集；尚未完成新起点的全部临床调整。**')
-    inference_status=(' 原100次保留，当前500或1000次区间见M3；原实际首剂主结果保留。' if precision_complete
+    inference_status=(f' 原100次保留，当前{precision_repetitions}次区间见M3；原实际首剂主结果保留。' if precision_complete
                       else ' 每套完成100次患者bootstrap，原实际首剂主结果保留。')
     lines=[heading+(inference_status if effects_complete else ' 没有计算新的MIMIC医嘱死亡差异。'),'',
         '|本轮实际结果|数量约数|','|---|---:|']
@@ -1457,7 +1473,7 @@ def publish():
         body=body.replace('下一轮优先完善这三种记录决策的解释和已固定区间精度；核心原始表已经具备，当前无新增下载要求。',
             '三种记录决策的差异与续跑后的区间在下方M3一并报告；核心原始表已经具备，当前无新增下载要求。')
         body=body.replace('当前MIMIC医嘱区间与原实际首剂500次区间、eICU100次患者正权重区间的抽样支持不同。下一步先完善不确定性解释及三种记录决策的差异，再扩至既定精度；增加重复次数不增加独立患者。',
-            '以上为首版100次历史区间。M3已续跑至500或1000次，普通患者重抽与患者正权重重抽的支持差异仍保留；增加重复次数不增加独立患者。')
+            f'以上为首版100次历史区间。M3已续跑至{precision_repetitions}次，普通患者重抽与患者正权重重抽的支持差异仍保留；增加重复次数不增加独立患者。')
     readme=REPO/'README.md';old=readme.read_text(encoding='utf-8');start='<!-- ORDER_BRIDGE_PROGRESS_START -->';end='<!-- ORDER_BRIDGE_PROGRESS_END -->'
     lo=old.index(start)+len(start);hi=old.index(end,lo)
     new=old[:lo]+'\n'+body+'\n'+old[hi:]

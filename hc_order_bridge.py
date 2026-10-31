@@ -1205,7 +1205,7 @@ def precision_progress(d,m):
     lines+=['','这些是固定权重下未知结局的极值界限，不包含抽样误差或未测混杂；未知仍保留，未填为存活。为避免由风险与界限联立反推少数未知结局的数量，公开表向外取整至整数百分点；精确值保存在原私有缓存中。',
         f'既定最大贡献医院排除分析沿用原结果：剩余约{m.count(site["remaining_cases"])}个启动节点，RD {100*p["risk_difference"]:+.2f}个百分点，RR {p["risk_ratio"]:.3f}；最大绝对SMD {site["balance"].smd_after.abs().max():.3f}，对照患者ESS {site["concentration"]["control_patient"]["ess"]:.1f}。仅有点估计，不添加未经计算的区间；它改变目标人群，不能代替医院整群不确定性或外部验证。','',
         '#### 未测混杂：有限的定量情景','',
-        '令U表示索引前尚未记录的病情或HC用途；δ为启动者与已加权对照的U患病比例差，γ₀为在暂不启动HC条件下U关联的死亡风险差。在已测协变量层内γ₀与δ均恒定的简化ATT模型中，偏倚为γ₀×δ；情景RD等于观察RD减去该偏倚。[VanderWeele与Arah的偏倚公式](https://doi.org/10.1097/EDE.0b013e3181f74493)为此提供一般框架。',
+        '令U表示索引前尚未记录、可能影响开药选择的临床状态，且在两组均有定义；δ为启动者与已加权对照中U的比例差，γ₀为在暂不启动HC条件下U关联的死亡风险差。在已测协变量层内γ₀与δ均恒定的简化ATT模型中，偏倚为γ₀×δ；情景RD等于观察RD减去该偏倚。[VanderWeele与Arah的偏倚公式](https://doi.org/10.1097/EDE.0b013e3181f74493)为此提供一般框架。',
         '本轮在续跑前固定γ₀=10、20、30个百分点，δ=−30、−20、−10、0、10、20、30个百分点，全部组合保留。它们是研究者情景，不是从HC用途或限制治疗资料估计的比例；正负失衡均评估。对固定偏倚平移抽样区间，没有为这些未知参数捏造概率分布。','',
         '|γ₀ \u00d7 δ|δ=10个百分点|δ=20个百分点|δ=30个百分点|','|---|---:|---:|---:|',
         '|γ₀=10个百分点|1个百分点|2个百分点|3个百分点|',
@@ -1374,6 +1374,7 @@ def cross_database_progress(d,m,actual):
     lines=['','### 两个医嘱分析的共同点与尚未消除的差别','',
         '|构件|MIMIC独立医嘱|eICU已有医嘱|','|---|---|---|',
         '|记录行动|原生POE关联IV HC处方，主口径明确New|medication中的IV HC医嘱；不代表已实际执行|',
+        '|索引字段|POE.ordertime，处方计划starttime另存|medication.drugorderoffset转为同住院时间；计划drugstartoffset另存|',
         '|感染资格|索引前实际抗菌药与诊断培养配对|索引前明确急性感染/脓毒症诊断记录|',
         '|NE状态与共同时间轴|首次观察ICU NE后首24h；当前正速率区间左极限|首次NE记录后的相同经过时间；此前60分钟有正速率记录|',
         '|对照来源|单中心全部合格NE来源，在各自相同NE经过时间|同一家医院内、各自相同NE经过时间的合格患者|',
@@ -1426,9 +1427,12 @@ def publish():
         ('全部风险集成员行（不是独立患者）',len(p))]
     complete='features' in d.get('clinical_phase',{})
     effects_complete=d.get('analysis_phase',{}).get('result_status')=='THREE_FIXED_ORDER_ASSOCIATIONS_100_SOURCE_PATIENT_BOOTSTRAPS'
+    precision_complete='validation' in d.get('precision_phase',{})
     if effects_complete:assert 'validation' in d['analysis_phase']
     heading='**已完成独立医嘱队列、临床重建、固定支持诊断与三套探索性关联估计。**' if effects_complete else ('**已完成独立来源、新起点临床重建及固定支持诊断。**' if complete else '**已完成独立来源及技术风险集；尚未完成新起点的全部临床调整。**')
-    lines=[heading+(' 每套完成100次患者bootstrap，原实际首剂主结果保留。' if effects_complete else ' 没有计算新的MIMIC医嘱死亡差异。'),'',
+    inference_status=(' 原100次保留，当前500或1000次区间见M3；原实际首剂主结果保留。' if precision_complete
+                      else ' 每套完成100次患者bootstrap，原实际首剂主结果保留。')
+    lines=[heading+(inference_status if effects_complete else ' 没有计算新的MIMIC医嘱死亡差异。'),'',
         '|本轮实际结果|数量约数|','|---|---:|']
     for label,n in counts:lines.append('|'+label+'|'+m.count(n)+'|')
     lines+=['','全部候选从完整成人NE来源独立选取，结果恰好没有增加旧风险集范围外的合格启动者。旧约230个桥接节点与本轮约210个节点的差异涉及新增的此前系统激素医嘱、同时间其他激素及未知途径规则；这是分析对象定义的变化，不是按效果或样本量选择。新结果不能称为扩样成功。','',
@@ -1447,6 +1451,13 @@ def publish():
         '与原实际首剂研究相比，本医嘱分析同时重建了起点、既往医嘱资格和治疗限制资料，目标人群也有变化。因此两版估计的差异不能全部归因于医嘱与给药的时间差；它们是同一临床主题下不同记录决策的比较。','',
         '**下一依赖：**完成三个记录决策的差异解释与不确定性完善，再更新稿件核心结果；不将增加bootstrap次数等同扩样。两库结果不会因方向不同而更换临床问题、阈值或模型。']
     body='\n'.join(lines)
+    if precision_complete:
+        body=body.replace('**下一依赖：**完成三个记录决策的差异解释与不确定性完善，再更新稿件核心结果；不将增加bootstrap次数等同扩样。两库结果不会因方向不同而更换临床问题、阈值或模型。',
+            '**下一依赖：**将已完成的主分析、医嘱补充及固定敏感性整合进现有稿件；不增加平行分析或新的报告。两库结果分别呈现，不因方向不同而更换临床问题、阈值或模型。')
+        body=body.replace('下一轮优先完善这三种记录决策的解释和已固定区间精度；核心原始表已经具备，当前无新增下载要求。',
+            '三种记录决策的差异与续跑后的区间在下方M3一并报告；核心原始表已经具备，当前无新增下载要求。')
+        body=body.replace('当前MIMIC医嘱区间与原实际首剂500次区间、eICU100次患者正权重区间的抽样支持不同。下一步先完善不确定性解释及三种记录决策的差异，再扩至既定精度；增加重复次数不增加独立患者。',
+            '以上为首版100次历史区间。M3已续跑至500或1000次，普通患者重抽与患者正权重重抽的支持差异仍保留；增加重复次数不增加独立患者。')
     readme=REPO/'README.md';old=readme.read_text(encoding='utf-8');start='<!-- ORDER_BRIDGE_PROGRESS_START -->';end='<!-- ORDER_BRIDGE_PROGRESS_END -->'
     lo=old.index(start)+len(start);hi=old.index(end,lo)
     new=old[:lo]+'\n'+body+'\n'+old[hi:]

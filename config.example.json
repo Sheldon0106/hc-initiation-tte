@@ -1,0 +1,10 @@
+{
+  "canonical_source_dir": "../HTE_sepsis",
+  "mimic_dir": "../restricted/mimic-iv-3.1",
+  "eicu_dir": "../restricted/eicu-crd-2.0",
+  "private_dir": "../restricted/hc-private",
+  "legacy_workspace": "../restricted/legacy-workspace",
+  "legacy_source_dir": "../restricted/legacy-workspace/clinical_tte_20261005",
+  "sepsis_defs": "../restricted/sepsis3_defs.py",
+  "poe_file": "../restricted/mimic-iv-3.1/hosp/poe.csv"
+}

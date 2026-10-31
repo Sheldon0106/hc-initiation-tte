@@ -1,0 +1,18 @@
+# Explicit source allowlist. Restricted data and local machine configuration
+# remain excluded even when the GitHub repository is private.
+*
+!.gitignore
+!.gitattributes
+!AGENTS.md
+!README.md
+!config.example.json
+!sync_sources.py
+!hc_order_bridge.py
+!test_hc_contracts.py
+!analysis/
+analysis/*
+!analysis/hc_paths.py
+!analysis/steroid_tte.py
+!analysis/steroid_sequential.py
+!analysis/steroid_event_review.py
+!analysis/steroid_eicu.py

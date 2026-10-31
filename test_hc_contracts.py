@@ -66,5 +66,61 @@ class EstimationAndExport(unittest.TestCase):
         self.assertNotIn('C:/Users/synthetic/',out)
         self.assertIn('../restricted/hc-private/example.csv',out)
 
+    def test_bootstrap_failures_and_undefined_ratios_remain_visible(self):
+        table=pd.DataFrame([
+            dict(success=True,risk_treated=.2,risk_control=.1,risk_difference=.1,risk_ratio=2.,warnings=[]),
+            dict(success=True,risk_treated=.3,risk_control=0.,risk_difference=.3,risk_ratio=np.nan,warnings=['synthetic warning']),
+            dict(success=False,error='synthetic empty control pool')])
+        result=bridge.bootstrap_summary(table)
+        self.assertEqual((result['attempts'],result['successful'],result['failures']),(3,2,1))
+        self.assertEqual(result['warning_replicates'],1)
+        self.assertEqual(result['intervals']['risk_ratio']['undefined_n'],1)
+        self.assertEqual(result['intervals']['risk_ratio']['finite_n'],1)
+        self.assertAlmostEqual(result['intervals']['risk_difference']['lower'],.105)
+        self.assertEqual(result['failure_reasons'],{'synthetic empty control pool':1})
+
+
+class ClinicalExtension(unittest.TestCase):
+    def test_partition_small_cells_have_complementary_suppression(self):
+        values=bridge.partition_percentages([130,68,2],200)
+        self.assertEqual(values,['65.0%','小样本或互补抑制','小样本或互补抑制'])
+        self.assertEqual(bridge.partition_percentages([80,120,0],200),['40.0%','60.0%','0.0%'])
+        with self.assertRaises(AssertionError):bridge.partition_percentages([80,119,0],200)
+
+    def test_projection_half_open_gaps(self):
+        t=np.array([-1.,0.,4.,5.,9.,10.])
+        got=bridge.outside_cached_window(t,np.zeros(6),np.full(6,10),np.full(6,4),np.full(6,9))
+        np.testing.assert_array_equal(got,[False,True,False,False,True,False])
+        got=bridge.outside_cached_window(t,np.zeros(6),np.full(6,10),np.full(6,np.nan),np.full(6,np.nan))
+        np.testing.assert_array_equal(got,[False,True,True,True,True,False])
+
+    def test_separate_limitations(self):
+        self.assertEqual(bridge.limitation_bits('Resuscitate (Full code)'),1)
+        self.assertEqual(bridge.limitation_bits('DNR'),2)
+        self.assertEqual(bridge.limitation_bits('Do Not Resuscitate / Do Not Intubate'),6)
+        self.assertEqual(bridge.limitation_bits('Comfort measures only'),8)
+        self.assertTrue(np.isnan(bridge.limitation_bits('Unknown')))
+        self.assertTrue(np.isnan(bridge.limitation_bits('Full code; DNR')))
+
+    def test_directive_expiry_and_preindex_boundary(self):
+        ev=pd.DataFrame(dict(time=[0.,20.],bits=[1.,2.],end=[10.,np.inf],poe_id=['synthetic-a','synthetic-b']))
+        queries=np.array([0.,5.,10.,11.,20.,21.]);v,t,f=bridge.order_code_at(ev,queries,np.full(6,-1.))
+        np.testing.assert_allclose(v,[np.nan,1.,1.,np.nan,np.nan,2.],equal_nan=True)
+        self.assertEqual(f[3],4);self.assertEqual(t[3],10.)
+        # Cancelling an older directive cannot invalidate a newer active one.
+        ev.loc[0,'end']=25.
+        v,_,_=bridge.order_code_at(ev,np.array([26.]),np.array([-1.]))
+        self.assertEqual(v[0],2.)
+
+    def test_conflicting_or_newer_unknown_directive(self):
+        v,d=bridge.combine_directives([1.,1.,2.],[5.,5.,5.],[2.,np.nan,1.],[5.,6.,4.])
+        np.testing.assert_allclose(v,[np.nan,np.nan,2.],equal_nan=True)
+        self.assertEqual(d[0],1.)
+
+    def test_existing_two_clock_and_ne_contracts(self):
+        checks=seq.hc_cf_tests()
+        self.assertTrue(checks['two_clock_synthetic'])
+        self.assertEqual(checks['random_bruteforce_groups'],200)
+
 
 if __name__=='__main__':unittest.main()

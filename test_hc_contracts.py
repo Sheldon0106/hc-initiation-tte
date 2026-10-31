@@ -60,9 +60,11 @@ class EstimationAndExport(unittest.TestCase):
         self.assertTrue(all(checks.values()))
 
     def test_export_changes_paths_only(self):
-        source='from pathlib import Path\nROOT=Path("old")\ndef risk(x):\n    return x.mean()\n'
+        source='from pathlib import Path\nROOT=Path("old")\ndef risk(x):\n    return x.mean()\nREPORT="C:/Users/synthetic/Documents/ChatGPT/TTE/HTE_sepsis/private/example.csv"\n'
         out=sync_sources.export(source,{'ROOT':'ROOT = Path(__file__).resolve().parent'})
         self.assertEqual(sync_sources.normalized(source,{'ROOT'}),sync_sources.normalized(out,{'ROOT'}))
+        self.assertNotIn('C:/Users/synthetic/',out)
+        self.assertIn('../restricted/hc-private/example.csv',out)
 
 
 if __name__=='__main__':unittest.main()

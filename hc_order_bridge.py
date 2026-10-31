@@ -245,21 +245,44 @@ def support():
     ref=b['source'].set_index('hadm_id');ctx=seq.context(b);ng={int(h):g for h,g in b['NE'].groupby('hadm_id')}
     og={int(h):g for h,g in d['orders'].groupby('hadm_id')};ug={int(h):g for h,g in d['unresolved_orders'].groupby('hadm_id')}
     first_gc=ctx[0];uncertain_gc=ctx[1];first_order=d['orders'][d['orders'].route.isin(['IV_prescribed','IM_prescribed','enteral_prescribed'])].groupby('hadm_id')['index'].min()
-    ne=b['NE'];start=ne.start-ne.hadm_id.map(ref.ne0);end=ne.end-ne.hadm_id.map(ref.ne0)
-    allrows=[];flow=[];began=time.perf_counter();last=began
+    ne=b['NE'];ne0=ne.hadm_id.map(ref.ne0);start=ne.start-ne0;end=ne.end-ne0
+    uncertain_order=d['orders'][d['orders'].route.isin(['route_unknown','route_conflict'])].groupby('hadm_id')['index'].min()
+    unresolved_start=d['unresolved_orders'].groupby('hadm_id').planned.min()
+    prior=pd.DataFrame(index=ref.index)
+    prior['actual']=pd.Series(first_gc);prior['uncertain_actual']=pd.Series(uncertain_gc)
+    prior['systemic_order']=first_order;prior['uncertain_order']=uncertain_order;prior['unresolved']=unresolved_start
+    prior=prior.fillna(np.inf).min(axis=1)
+    infection_possible=ref.index.isin(set(ctx[2])&set(ctx[3]))
+    allrows=[];flow=[];began=time.perf_counter();last=began;equivalence_checked=False
     for case in d['cases'].itertuples():
-        elapsed=case.elapsed_h*3600;possible=set(ne.loc[(start<elapsed)&(end>=elapsed),'hadm_id'])
+        elapsed=case.elapsed_h*3600;tall=ref.ne0+elapsed;tn=ne0+elapsed
+        active=(start<elapsed)&(end>=elapsed)&ne.start.lt(tn)&ne.end.ge(tn)
+        if 'icu_lo' in ne:active&=ne.icu_lo.le(tn)&ne.icu_hi.gt(tn)
+        locations=ne.loc[active,['hadm_id','stay_id']].drop_duplicates()
+        locations=locations[~locations.hadm_id.duplicated(False)].set_index('hadm_id').stay_id
+        eligible=infection_possible&ref.subject_id.ne(case.subject_id)&tall.lt(ref.discharge)&(ref.death_time.isna()|tall.lt(ref.death_time))&tall.lt(prior)
+        ids=ref.index[eligible&ref.index.isin(locations.index)]
+        candidates=ref.loc[ids,['subject_id','ne0']].copy();candidates['index']=tall.loc[ids];candidates['stay_id']=locations.reindex(ids)
         controls=[]
-        for h in sorted(possible):
-            s=ref.loc[h];t=float(s.ne0+elapsed)
-            if s.subject_id==case.subject_id or t>=s.discharge or (np.isfinite(s.death_time) and t>=s.death_time):continue
-            if first_gc.get(h,np.inf)<=t or uncertain_gc.get(h,np.inf)<=t or first_order.get(h,np.inf)<=t:continue
-            active,stay,_=active_ne_record(ng[h],t)
-            if not active:continue
-            if order_history(og.get(h),ug.get(h),t)!='NO_PRIOR_RECORDED_SYSTEMIC_GC_ORDER':continue
+        for s in candidates.itertuples():
+            h=int(s.Index);t=float(s.index)
             state,strict=seq.qualify(h,t,ctx,m,False)
             if state!='QUALIFIED_RECORD_PROXY':continue
-            controls.append(dict(case_id=case.case_id,hadm_id=int(h),subject_id=int(s.subject_id),stay_id=int(stay),index=t,elapsed_h=case.elapsed_h,treated=0,strict_infection=strict))
+            controls.append(dict(case_id=case.case_id,hadm_id=h,subject_id=int(s.subject_id),stay_id=int(s.stay_id),index=t,elapsed_h=case.elapsed_h,treated=0,strict_infection=strict))
+        if not equivalence_checked:
+            # Fixed first case, full original scalar reference; no outcomes.
+            scalar=set();possible=set(ne.loc[(start<elapsed)&(end>=elapsed),'hadm_id'])
+            for h in sorted(possible):
+                s=ref.loc[h];t=float(s.ne0+elapsed)
+                if s.subject_id==case.subject_id or t>=s.discharge or (np.isfinite(s.death_time) and t>=s.death_time):continue
+                if first_gc.get(h,np.inf)<=t or uncertain_gc.get(h,np.inf)<=t or first_order.get(h,np.inf)<=t:continue
+                on,stay,_=active_ne_record(ng[h],t)
+                if not on or order_history(og.get(h),ug.get(h),t)!='NO_PRIOR_RECORDED_SYSTEMIC_GC_ORDER':continue
+                state,strict=seq.qualify(h,t,ctx,m,False)
+                if state=='QUALIFIED_RECORD_PROXY':scalar.add((int(h),int(stay),t,bool(strict)))
+            vector={(r['hadm_id'],r['stay_id'],r['index'],bool(r['strict_infection'])) for r in controls}
+            assert scalar==vector,'BATCH_SCALAR_RISKSET_MISMATCH'
+            equivalence_checked=True;say(dict(stage='batch_scalar_equivalence',passed=True,controls=m.count(len(scalar))))
         flow.append(dict(case_id=case.case_id,controls=len(controls)))
         allrows.append(dict(case_id=case.case_id,hadm_id=case.hadm_id,subject_id=case.subject_id,stay_id=int(case.stay_id),index=case.index,elapsed_h=case.elapsed_h,treated=1,strict_infection=case.strict_infection));allrows.extend(controls)
         if time.perf_counter()-last>30:
@@ -275,6 +298,7 @@ def support():
     case_subject=panel[panel.treated.eq(1)].set_index('case_id').subject_id
     assert panel.loc[panel.treated.eq(0),'subject_id'].ne(panel.loc[panel.treated.eq(0),'case_id'].map(case_subject)).all()
     d.update(risksets=panel,support=flow,panel_envelope_coverage=pd.DataFrame(cov),support_seconds=round(time.perf_counter()-began,1),
+        support_implementation=dict(reason='Batch identical history and active-interval conditions after slow scalar run; no new model or clinical rule',scalar_first_case_equals_batch=equivalence_checked,initial_source_commit='be59458'),
         checks=dict(independent_source=True,native_identity_only=True,eligibility_before_execution=True,no_future_survival=True,
             distinct_control_patient=True,same_NE_elapsed=True,no_outcome_model=True,frozen_actual_cache_unchanged=True))
     save(d)
@@ -283,8 +307,57 @@ def support():
         control_pool_median=float(flow.controls.median()),seconds=d['support_seconds'],models=0,effects=0))
 
 
+def publish():
+    b,e,d=load();assert 'risksets' in d;m=seq.base();p=d['risksets'];c=d['cases'];flow=d['support']
+    co=p[p.treated.eq(0)];cov=d['panel_envelope_coverage'];first=d['first_orders']
+    raw_bytes=sum(r['bytes_read'] for r in d['runs']);seconds=sum(r['seconds'] for r in d['runs'])
+    peak=max(r['peak_MB'] for r in d['runs'])
+    counts=[('全部成人NE来源住院',len(b['source'])),('首次原生关联IV HC医嘱',len(first)),
+        ('符合当前记录资格的技术启动节点',len(c)),('来自旧风险集范围之外的合格节点',int((~c.old_riskset_admission).sum())),
+        ('没有同经过时间对照的节点',int(flow.controls.eq(0).sum())),('独立对照患者',co.subject_id.nunique()),
+        ('全部风险集成员行（不是独立患者）',len(p))]
+    lines=['**已完成独立来源及技术风险集；尚未完成新起点的全部临床调整。** 没有计算新的MIMIC医嘱死亡差异。','',
+        '|本轮实际结果|数量约数|','|---|---:|']
+    for label,n in counts:lines.append('|'+label+'|'+m.count(n)+'|')
+    lines+=['','全部候选从完整成人NE来源独立选取，结果恰好没有增加旧风险集范围外的合格启动者。旧约230个桥接节点与本轮约210个节点的差异涉及新增的此前系统激素医嘱、同时间其他激素及未知途径规则；这是分析对象定义的变化，不是按效果或样本量选择。新结果不能称为扩样成功。','',
+        '首条关联POE的transaction_type：'+ '；'.join(str(k)+'约'+m.count(v) for k,v in c.transaction_type.value_counts(dropna=False).items())+'。Change目前单列，不能自动当作全新的治疗决定，也不因后来执行或死亡删除。进入估计前需解释其原生版本链。','',
+        '|变量回看窗|启动节点：窗口完整缓存 / 尚未完整投影|对照成员：窗口完整缓存 / 总成员|','|---|---:|---:|']
+    for var in ['MAP','GCS','lactate','creatinine']:
+        t=cov[cov.variable.eq(var)&cov.arm.eq(1)].iloc[0];a=cov[cov.variable.eq(var)&cov.arm.eq(0)].iloc[0]
+        lines.append('|'+var+'|'+m.count(t.full_window_cached)+' / '+m.count(t.rows-t.full_window_cached)+'|'+m.count(a.full_window_cached)+' / '+m.count(a.rows)+'|')
+    lines+=['','窗口完整缓存表示原提取范围覆盖所需观察区间，不表示存在该项测量，更不表示医生当时已知。尚未投影不能记成临床缺失；不按完整病例缩减此队列。下一步在相同起点恢复病情和治疗限制，区分测量与录入时钟，按确定缺口决定是否补取。','',
+        f'本轮两表实际读取{raw_bytes/2**30:.2f} GiB，解析{seconds/60:.1f}分钟，峰值进程内存{peak:.1f} MB；风险集构建约{d["support_seconds"]:.1f}秒。处方与POE投影均读至EOF，保留输入签名和流式哈希。原逐患者构建因重复筛选较慢而中止，批量版本在固定首节点与完整原规则核对一致；资格与时钟未修改。无需再次下载或重扫这两张表。','',
+        '**下一依赖：**完成新索引的临床字段与治疗限制、核清Change版本、固定同口径分析与推断，再估计医嘱关联。两库结果不会因目前方向不同而更换临床问题、阈值或模型。']
+    body='\n'.join(lines)
+    readme=REPO/'README.md';old=readme.read_text(encoding='utf-8');start='<!-- ORDER_BRIDGE_PROGRESS_START -->';end='<!-- ORDER_BRIDGE_PROGRESS_END -->'
+    lo=old.index(start)+len(start);hi=old.index(end,lo)
+    new=old[:lo]+'\n'+body+'\n'+old[hi:]
+    for text in ['在原缓存范围外补取系统激素处方与必要POE键，记录字段、过滤、字节数、耗时和完整读取检查。',
+                 '在医嘱时点重新判断NE、此前感染证据、实际及医嘱激素历史，区分冲突、未提取与未记录。',
+                 '由全来源建立同NE经过时间的未启动对照，保留后续允许启动的通常照护比较。']:
+        new=new.replace('- [ ] '+text,'- [x] '+text)
+    readme.write_bytes(new.encode('utf-8'))
+    report=configured_path('canonical_source_dir','../HTE_sepsis')/'steroid_tte.md'
+    before=report.read_bytes();nl='\r\n' if b'\r\n' in before else '\n';old=before.decode('utf-8').replace('\r\n','\n')
+    marker='<!-- HC_MIMIC_INDEPENDENT_ORDER_START -->';ending='<!-- HC_MIMIC_INDEPENDENT_ORDER_END -->'
+    section=marker+'\n### 2026-10-31：独立MIMIC医嘱来源与风险集\n\n'+body+'\n\n研究执行清单维护在[独立HC仓库README](../HC_TTE/README.md)，[私有GitHub仓库](https://github.com/Sheldon0106/hc-initiation-tte)同步代码与计划；原HC源码、实际首剂结果、Word稿及会议HTML保留。\n'+ending
+    if marker in old:
+        lo=old.index(marker);hi=old.index(ending,lo)+len(ending);out=old[:lo]+section+old[hi:]
+    else:
+        anchor='### 实际代码与证据位置';assert old.count(anchor)==1;out=old.replace(anchor,section+'\n\n'+anchor,1)
+    after=out.replace('\n',nl).encode('utf-8')
+    if after!=before:
+        history=d.setdefault('report_history',[]);digest=hashlib.sha256(before).hexdigest()
+        if not any(z['sha256']==digest for z in history):history.append(dict(sha256=digest,bytes=before))
+        assert report.read_bytes()==before
+        report.write_bytes(after)
+    d['publication']=dict(report_hash=hashlib.sha256(after).hexdigest(),README_hash=hashlib.sha256(new.encode('utf-8')).hexdigest())
+    d['source_current']=Path(__file__).read_bytes();save(d)
+    say(dict(stage='publish',canonical_reports_updated=2,new_report_files=0,models=0,effects=0))
+
+
 def main():
-    p=argparse.ArgumentParser();p.add_argument('stage',choices=['plan','project','evaluate','support']);a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('stage',choices=['plan','project','evaluate','support','publish']);a=p.parse_args()
     globals()[a.stage]()
 
 

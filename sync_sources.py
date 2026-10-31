@@ -1,12 +1,13 @@
 """Publish explicit HC source snapshots; preserve originals and analysis logic.
 
-Only top-level machine-path declarations change. A normalized AST comparison
+Only machine-path declarations and local report links change. A normalized AST comparison
 checks that no other executable or statistical code changes in the export.
 This command never reads patient caches and never invokes Git or a network API.
 """
 import ast
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -36,8 +37,13 @@ REPLACEMENTS = {
         'PRIVATE': "PRIVATE = configured_path('private_dir', '../restricted/hc-private')"}}
 
 
+def portable_report_paths(text):
+    return re.sub(r'C:/Users/[^/\r\n]+/Documents/ChatGPT/TTE/HTE_sepsis/private/',
+                  '../restricted/hc-private/', text)
+
+
 def normalized(text, names):
-    tree = ast.parse(text)
+    tree = ast.parse(portable_report_paths(text))
     tree.body = [node for node in tree.body
                  if not (isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in names for t in node.targets))
                  and not (isinstance(node, ast.ImportFrom) and node.module == 'hc_paths')]
@@ -56,7 +62,7 @@ def export(text, replacements):
         lines[lo:hi] = [replacement]
     anchor = next(i for i, line in enumerate(lines) if line.startswith('from pathlib import Path'))
     lines.insert(anchor + 1, 'from hc_paths import configured_path')
-    result = '\n'.join(lines) + '\n'
+    result = portable_report_paths('\n'.join(lines) + '\n')
     assert normalized(text, replacements) == normalized(result, replacements)
     return result
 
@@ -68,7 +74,7 @@ def main():
         original = (source / name).read_bytes()
         text = original.decode('utf-8-sig').replace('\r\n', '\n')
         result = export(text, substitutions)
-        for prohibited in ['C:\\Users\\', 'F:\\2025summer\\', 'F:/2025summer/']:
+        for prohibited in ['C:\\Users\\', 'C:/Users/', 'F:\\2025summer\\', 'F:/2025summer/']:
             assert prohibited not in result, (name, 'machine_path_remaining')
         target = REPO / 'analysis' / name
         target.write_text(result, encoding='utf-8', newline='') if sys.version_info >= (3, 10) else target.write_bytes(result.encode('utf-8'))
